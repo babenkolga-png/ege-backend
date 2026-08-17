@@ -1,15 +1,14 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from pydantic import BaseModel
-import datetime
-import random
-from database import SessionLocal, engine 
-import models
+import models, database
+import json
 
 app = FastAPI()
-models.Base.metadata.create_all(bind=engine)
 
+# Разрешаем запросы с любых сайтов (для Netlify)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,117 +17,149 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Подключение к БД
 def get_db():
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-class AttemptCreate(BaseModel):
-    question_id: str 
+# --- Схемы данных (Pydantic) ---
+class SubmitAttempt(BaseModel):
+    session_id: int
+    question_id: str
     is_correct: bool
-    time_spent: int 
+    time_spent: int
 
-@app.get("/")
-def read_root():
-    return {"message": "Сервер ЕГЭ-2027 работает!"}
+class FinishSession(BaseModel):
+    session_id: int
+    total_time_seconds: int
 
-@app.get("/questions")
-def get_questions(db: Session = Depends(get_db)):
-    return db.query(models.Question).all()
+# --- Маршруты (Endpoints) ---
 
 @app.get("/generate_full_test")
 def generate_full_test(db: Session = Depends(get_db)):
-    incorrect_attempts = db.query(models.Attempt).filter(
-        models.Attempt.user_id == 1, 
-        models.Attempt.is_correct == False
-    ).all()
-    
-    error_tags = {}
-    for attempt in incorrect_attempts:
-        # Игнорируем макротекст при сборке варианта 1-21
-        if not attempt.question_id.startswith("macro_"):
-            try:
-                q_id = int(attempt.question_id)
-                q = db.query(models.Question).filter(models.Question.id == q_id).first()
-                if q:
-                    error_tags[q.micro_tag] = error_tags.get(q.micro_tag, 0) + 1
-            except ValueError:
-                pass
+    # 1. Создаем новую сессию (вариант)
+    new_session = models.TestSession(total_questions=26)
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
 
-    full_test = []
-    available_task_nums = db.query(models.Question.task_num).distinct().all()
-    task_nums = [t[0] for t in available_task_nums] 
+    test_questions = []
+
+    # 2. Собираем задания 1-21
+    for i in range(1, 22):
+        q = db.query(models.Question).filter(models.Question.task_num == i).order_by(func.random()).first()
+        if q:
+            test_questions.append({
+                "id": str(q.id),
+                "task_num": q.task_num,
+                "type": "standard",
+                "text": q.text,
+                "correct_answer": q.correct_answer,
+                "explanation": q.explanation,
+                "tag": q.tag
+            })
+
+    # 3. Достаем 1 случайный макротекст
+    macro_text = db.query(models.MacroText).order_by(func.random()).first()
     
-    for task_i in task_nums:
-        available_questions = db.query(models.Question).filter(models.Question.task_num == task_i).all()
-        error_questions = [q for q in available_questions if q.micro_tag in error_tags]
-        
-        if error_questions:
-            max_errors = max([error_tags[q.micro_tag] for q in error_questions])
-            top_questions = [q for q in error_questions if error_tags[q.micro_tag] == max_errors]
-            selected_q = random.choice(top_questions)
-        else:
-            selected_q = random.choice(available_questions)
+    if macro_text:
+        text_data = {
+            "text_id": macro_text.id,
+            "author": macro_text.author,
+            "source_info": macro_text.source_info,
+            "sentences": json.loads(macro_text.sentences_json)
+        }
+
+        # 4. Достаем вопросы 22-26 к этому конкретному тексту
+        macro_qs = db.query(models.MacroQuestion).filter(models.MacroQuestion.text_id == macro_text.id).order_by(models.MacroQuestion.task_num).all()
+        for mq in macro_qs:
+            # Распаковываем JSON-ответы обратно в словари/списки
+            parsed_correct = json.loads(mq.correct_answer) if mq.q_type == 'review_gap_fill' else mq.correct_answer
             
-        full_test.append(selected_q)
-        
-    full_test.sort(key=lambda x: x.task_num)
-    return full_test
+            test_questions.append({
+                "id": mq.id,
+                "task_num": mq.task_num,
+                "type": mq.q_type,
+                "instruction": mq.instruction,
+                "options": json.loads(mq.options_json) if mq.options_json else [],
+                "correct_answer": parsed_correct,
+                "explanation": mq.explanation,
+                "highlight_sentences": json.loads(mq.highlight_sentences_json) if mq.highlight_sentences_json else [],
+                "review_text": mq.review_text,
+                "terms_list": json.loads(mq.terms_list_json) if mq.terms_list_json else [],
+                "macro_text": text_data # Прикрепляем текст к вопросу, React покажет его когда нужно
+            })
+
+    return {
+        "session_id": new_session.id,
+        "questions": test_questions
+    }
 
 @app.post("/submit_attempt")
-def submit_attempt(attempt: AttemptCreate, db: Session = Depends(get_db)):
+def submit_attempt(attempt: SubmitAttempt, db: Session = Depends(get_db)):
+    # Сохраняем ответ с привязкой к номеру сессии
     new_attempt = models.Attempt(
-        user_id=1,
+        session_id=attempt.session_id,
         question_id=attempt.question_id,
         is_correct=attempt.is_correct,
-        time_spent=attempt.time_spent,
-        timestamp=datetime.datetime.utcnow().isoformat()
+        time_spent=attempt.time_spent
     )
     db.add(new_attempt)
     db.commit()
     return {"status": "success"}
 
+@app.post("/finish_session")
+def finish_session(data: FinishSession, db: Session = Depends(get_db)):
+    # Завершаем тест, записываем итоговое время и баллы
+    session = db.query(models.TestSession).filter(models.TestSession.id == data.session_id).first()
+    if session:
+        session.is_finished = True
+        session.time_spent_seconds = data.total_time_seconds
+        
+        # Считаем, сколько было правильных ответов в этой сессии
+        correct_count = db.query(models.Attempt).filter(
+            models.Attempt.session_id == data.session_id,
+            models.Attempt.is_correct == True
+        ).count()
+        session.score = correct_count
+        
+        db.commit()
+        return {"status": "success", "score": correct_count}
+    raise HTTPException(status_code=404, detail="Сессия не найдена")
+
 @app.get("/statistics")
 def get_statistics(db: Session = Depends(get_db)):
-    all_attempts = db.query(models.Attempt).filter(models.Attempt.user_id == 1).all()
+    # Считаем количество полностью решенных вариантов
+    completed_sessions = db.query(models.TestSession).filter(models.TestSession.is_finished == True).count()
     
-    total = len(all_attempts)
-    correct = sum(1 for a in all_attempts if a.is_correct)
-    percent = round((correct / total * 100), 1) if total > 0 else 0
-    
-    stats_by_date = {}
-    error_tags = {}
+    # Считаем общую статистику
+    total_attempts = db.query(models.Attempt).count()
+    correct_attempts = db.query(models.Attempt).filter(models.Attempt.is_correct == True).count()
+    accuracy = round((correct_attempts / total_attempts) * 100) if total_attempts > 0 else 0
 
-    for attempt in all_attempts:
-        date = attempt.timestamp[:10] 
-        if date not in stats_by_date:
-            stats_by_date[date] = {"total": 0, "correct": 0, "time": 0} 
-            
-        stats_by_date[date]["total"] += 1
-        stats_by_date[date]["time"] += (attempt.time_spent or 0)
-        
-        if not attempt.is_correct:
-            if attempt.question_id.startswith("macro_"):
-                task_num = attempt.question_id.replace("macro_", "")
-                tag = f"Задание {task_num} (Макротекст)"
-                error_tags[tag] = error_tags.get(tag, 0) + 1
-            else:
-                try:
-                    q_id = int(attempt.question_id)
-                    q = db.query(models.Question).filter(models.Question.id == q_id).first()
-                    tag = q.micro_tag if q else f"Неизвестный тег"
-                    error_tags[tag] = error_tags.get(tag, 0) + 1
-                except ValueError:
-                    pass
+    # Динамика по дням
+    by_date_query = db.query(
+        func.date(models.Attempt.timestamp).label("date"),
+        func.count(models.Attempt.id).label("total"),
+        func.sum(func.cast(models.Attempt.is_correct, models.Integer)).label("correct"),
+        func.sum(models.Attempt.time_spent).label("time")
+    ).group_by("date").all()
 
-    top_errors = sorted([{"tag": k, "errors": v} for k, v in error_tags.items()], key=lambda x: x["errors"], reverse=True)
+    by_date = {}
+    for row in by_date_query:
+        by_date[str(row.date)] = {
+            "total": row.total,
+            "correct": row.correct if row.correct else 0,
+            "time": row.time if row.time else 0
+        }
 
     return {
-        "total_answered": total, 
-        "correct_answers": correct, 
-        "accuracy": percent,
-        "by_date": stats_by_date,
-        "top_errors": top_errors
+        "total_variants": completed_sessions,  # <- Вот оно, количество вариантов!
+        "total_answered": total_attempts,
+        "accuracy": accuracy,
+        "by_date": by_date,
+        "top_errors": []
     }
